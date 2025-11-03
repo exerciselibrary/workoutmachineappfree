@@ -888,6 +888,40 @@ class VitruvianApp {
     this.chartManager.viewWorkout(workout);
   }
 
+  exportWorkoutDetailedCSV(index) {
+    if (index < 0 || index >= this.workoutHistory.length) {
+      this.addLogEntry("Invalid workout index", "error");
+      return;
+    }
+
+    if (!this.dropboxManager.isConnected) {
+      alert("Please connect to Dropbox first to export detailed CSV files");
+      return;
+    }
+
+    const workout = this.workoutHistory[index];
+    if (!workout.movementData || workout.movementData.length === 0) {
+      alert("This workout does not have detailed movement data");
+      return;
+    }
+
+    this.addLogEntry(`Exporting detailed CSV for workout (${workout.movementData.length} data points)...`, "info");
+
+    // Get unit conversion function
+    const toDisplayFn = this.weightUnit === "lb"
+      ? (kg) => kg * LB_PER_KG
+      : (kg) => kg;
+
+    this.dropboxManager.exportWorkoutDetailedCSV(workout, this.getUnitLabel(), toDisplayFn)
+      .then(() => {
+        this.addLogEntry("Detailed workout CSV exported to Dropbox", "success");
+      })
+      .catch((error) => {
+        this.addLogEntry(`Failed to export CSV: ${error.message}`, "error");
+        alert(`Failed to export CSV: ${error.message}`);
+      });
+  }
+
   updateHistoryDisplay() {
     const historyList = document.getElementById("historyList");
     if (!historyList) return;
@@ -911,6 +945,10 @@ class VitruvianApp {
         const viewButtonHtml = hasTimingData
           ? `<button class="view-graph-btn" onclick="app.viewWorkoutOnGraph(${index})" title="View this workout on the graph">📊 View Graph</button>`
           : "";
+        const hasMovementData = workout.movementData && workout.movementData.length > 0;
+        const exportButtonHtml = hasMovementData
+          ? `<button class="view-graph-btn" onclick="app.exportWorkoutDetailedCSV(${index})" title="Export detailed CSV with all movement data">💾 Export CSV</button>`
+          : "";
 return `
   <div class="history-item">
     <div class="history-item-title">
@@ -919,9 +957,10 @@ return `
       ${workout.setNumber && workout.setTotal ? ` (Set ${workout.setNumber}/${workout.setTotal})` : ""}
     </div>
     <div class="history-item-details">
-      ${weightStr} • ${workout.reps} reps
+      ${weightStr} • ${workout.reps} reps${hasMovementData ? ` • ${workout.movementData.length} data points` : ""}
     </div>
     ${viewButtonHtml}
+    ${exportButtonHtml}
   </div>    `;
       })
       .join("");
@@ -940,6 +979,12 @@ if (setLabel) setLabel.textContent = "";
     const endTime = new Date();
     this.currentWorkout.endTime = endTime;
 
+    // Extract movement data for this workout from chart history
+    const movementData = this.extractWorkoutMovementData(
+      this.currentWorkout.startTime,
+      endTime
+    );
+
     const workout = {
       mode: this.currentWorkout.mode,
       weightKg: this.currentWorkout.weightKg,
@@ -953,9 +998,19 @@ if (setLabel) setLabel.textContent = "";
       setNumber: this.currentWorkout.setNumber ?? null,
       setTotal: this.currentWorkout.setTotal ?? null,
       itemType: this.currentWorkout.itemType || null,
+
+      // Include detailed movement data (positions and loads over time)
+      movementData: movementData,
     };
 
     this.addToWorkoutHistory(workout);
+
+    // Log movement data capture
+    if (movementData.length > 0) {
+      this.addLogEntry(`Captured ${movementData.length} movement data points`, "info");
+    } else {
+      this.addLogEntry("Warning: No movement data captured for this workout", "warning");
+    }
 
     // Auto-save to Dropbox if connected
     if (this.dropboxManager.isConnected) {
@@ -985,6 +1040,31 @@ if (setLabel) setLabel.textContent = "";
     /* no-op */
   }
 }
+
+  // Extract movement data for a specific time range from chart history
+  extractWorkoutMovementData(startTime, endTime) {
+    if (!this.chartManager || !this.chartManager.loadHistory) {
+      return [];
+    }
+
+    const startMs = startTime.getTime();
+    const endMs = endTime.getTime();
+
+    // Filter loadHistory to only include data points within the workout timeframe
+    const workoutData = this.chartManager.loadHistory.filter((point) => {
+      const pointMs = point.timestamp.getTime();
+      return pointMs >= startMs && pointMs <= endMs;
+    });
+
+    // Convert to a simpler format for JSON storage
+    return workoutData.map((point) => ({
+      timestamp: point.timestamp.toISOString(),
+      loadA: point.loadA,
+      loadB: point.loadB,
+      posA: point.posA,
+      posB: point.posB,
+    }));
+  }
 
 
   // Get dynamic window size based on workout phase

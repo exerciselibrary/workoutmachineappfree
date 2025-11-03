@@ -335,6 +335,57 @@ class DropboxManager {
     }
   }
 
+  // Export individual workout with detailed movement data as CSV
+  async exportWorkoutDetailedCSV(workout, unitLabel = "kg", toDisplayFn = (v) => v) {
+    if (!this.isConnected) {
+      throw new Error("Not connected to Dropbox");
+    }
+
+    try {
+      // Check if workout has movement data
+      if (!workout.movementData || workout.movementData.length === 0) {
+        this.log("Workout does not have detailed movement data", "error");
+        return false;
+      }
+
+      // Build CSV content with detailed movement data
+      let csv = `Timestamp,Total Load (${unitLabel}),Right Load (${unitLabel}),Left Load (${unitLabel}),Right Position,Left Position\n`;
+
+      const csvDecimals = unitLabel === "lb" ? 2 : 1;
+      for (const point of workout.movementData) {
+        const timestamp = point.timestamp;
+        const totalKg = point.loadA + point.loadB;
+        const totalLoad = toDisplayFn(totalKg).toFixed(csvDecimals);
+        const loadA = toDisplayFn(point.loadA).toFixed(csvDecimals);
+        const loadB = toDisplayFn(point.loadB).toFixed(csvDecimals);
+        const posA = point.posA;
+        const posB = point.posB;
+        csv += `${timestamp},${totalLoad},${loadA},${loadB},${posA},${posB}\n`;
+      }
+
+      // Generate filename
+      const timestamp = workout.timestamp || workout.endTime || new Date();
+      const dateStr = new Date(timestamp).toISOString().replace(/[:.]/g, "-");
+      const mode = (workout.mode || "workout").replace(/\s+/g, "_");
+      const setName = workout.setName ? `_${workout.setName.replace(/\s+/g, "_")}` : "";
+      const filename = `workout_detailed_${mode}${setName}_${dateStr}.csv`;
+
+      // Upload to Dropbox in /workouts folder
+      await this.dbx.filesUpload({
+        path: `/workouts/${filename}`,
+        contents: csv,
+        mode: { ".tag": "add" },
+        autorename: true,
+      });
+
+      this.log(`Exported detailed workout CSV: ${filename} (${workout.movementData.length} data points)`, "success");
+      return true;
+    } catch (error) {
+      this.log(`Failed to export detailed workout CSV: ${error.message}`, "error");
+      throw error;
+    }
+  }
+
   // PKCE helper: Generate code verifier
   generateCodeVerifier() {
     const array = new Uint8Array(32);
