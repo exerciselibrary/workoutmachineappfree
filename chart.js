@@ -340,9 +340,7 @@ class ChartManager {
     return `${value.toFixed(this.loadUnit.decimals)} ${this.loadUnit.label}`;
   }
 
-  // Update chart with all data and trim time scale to current time range.
-  updateChartData() {
-    // Create fresh arrays each time
+  buildSeriesFromPoints(points) {
     const timestamps = [];
     const totalLoads = [];
     const loadsB = [];
@@ -350,24 +348,32 @@ class ChartManager {
     const positionsB = [];
     const positionsA = [];
 
-    for (const point of this.loadHistory) {
-      timestamps.push(point.timestamp.getTime() / 1000); // Convert to Unix seconds
-      const totalKg = point.loadA + point.loadB;
+    for (const point of points) {
+      if (!point || !(point.timestamp instanceof Date)) {
+        continue;
+      }
+
+      const timestampSeconds = point.timestamp.getTime() / 1000;
+      timestamps.push(timestampSeconds);
+
+      const loadA = Number(point.loadA) || 0;
+      const loadB = Number(point.loadB) || 0;
+      const totalKg = loadA + loadB;
+
       const displayTotal = this.loadUnit.toDisplay(totalKg);
-      const displayB = this.loadUnit.toDisplay(point.loadB);
-      const displayA = this.loadUnit.toDisplay(point.loadA);
+      const displayB = this.loadUnit.toDisplay(loadB);
+      const displayA = this.loadUnit.toDisplay(loadA);
 
       totalLoads.push(
         displayTotal != null && isFinite(displayTotal) ? displayTotal : 0,
       );
       loadsB.push(displayB != null && isFinite(displayB) ? displayB : 0);
       loadsA.push(displayA != null && isFinite(displayA) ? displayA : 0);
-      positionsB.push(point.posB);
-      positionsA.push(point.posA);
+      positionsB.push(Number(point.posB) || 0);
+      positionsA.push(Number(point.posA) || 0);
     }
 
-    // Data order: timestamps, Total Load, Left Load (B), Right Load (A), Left Pos (B), Right Pos (A)
-    const data = [
+    return [
       timestamps,
       totalLoads,
       loadsB,
@@ -375,6 +381,13 @@ class ChartManager {
       positionsB,
       positionsA,
     ];
+  }
+
+  // Update chart with all data and trim time scale to current time range.
+  updateChartData() {
+    const data = this.buildSeriesFromPoints(this.loadHistory);
+    const timestamps = data[0];
+
     this.chart.setData(data);
 
     // Auto-scroll to show latest data if user hasn't manually panned
@@ -529,12 +542,28 @@ class ChartManager {
 
     this.setEventMarkers(markers);
 
+    // Replace chart data with the workout's movement data if available
+    let displayedReplayData = false;
+    if (Array.isArray(workout.movementData) && workout.movementData.length > 0) {
+      const data = this.buildSeriesFromPoints(workout.movementData);
+      if (data[0].length > 0) {
+        this.chart.setData(data);
+        displayedReplayData = true;
+      } else if (this.onLog) {
+        this.onLog("Workout does not have valid movement data for the chart", "warning");
+      }
+    } else if (this.onLog) {
+      this.onLog("Workout does not have movement data to display", "warning");
+    }
+
     // Set time range to show the workout
     this.live = false;
     this.currentTimeRange = null;
 
-    // Update chart data to ensure the latest workout is loaded
-    this.updateChartData();
+    // If no replay data was shown, fall back to current load history
+    if (!displayedReplayData) {
+      this.updateChartData();
+    }
 
     // Update button active states to show "All" is active
     document.getElementById("range10s").classList.remove("active");

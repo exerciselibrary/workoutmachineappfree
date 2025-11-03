@@ -46,6 +46,9 @@ class VitruvianApp {
     this.planRestTimer = null;  // rest countdown handle
     this.planOnWorkoutComplete = null; // hook assigned while plan is running
 
+    this._hasPerformedInitialSync = false; // track if we've auto-synced once per session
+    this._autoSyncInFlight = false;
+
     // initialize plan UI dropdown from storage
     setTimeout(() => {
       this.populatePlanSelect();
@@ -102,9 +105,16 @@ class VitruvianApp {
     };
 
     // Initialize Dropbox (check for existing token or OAuth callback)
-    this.dropboxManager.init().catch((error) => {
-      this.addLogEntry(`Dropbox initialization error: ${error.message}`, "error");
-    });
+    this.dropboxManager
+      .init()
+      .then(() => {
+        if (this.dropboxManager.isConnected) {
+          this.scheduleAutoDropboxSync("init");
+        }
+      })
+      .catch((error) => {
+        this.addLogEntry(`Dropbox initialization error: ${error.message}`, "error");
+      });
   }
 
   updateDropboxUI(isConnected) {
@@ -125,6 +135,8 @@ class VitruvianApp {
 
       // Show last backup info if available
       this.updateLastBackupDisplay();
+
+      this.scheduleAutoDropboxSync("connection-change");
     } else {
       if (notConnectedDiv) notConnectedDiv.style.display = "block";
       if (connectedDiv) connectedDiv.style.display = "none";
@@ -135,7 +147,29 @@ class VitruvianApp {
         statusBadge.style.background = "#e0e0e0";
         statusBadge.style.color = "#6c757d";
       }
+
+      this._autoSyncInFlight = false;
+      this._hasPerformedInitialSync = false;
     }
+  }
+
+  scheduleAutoDropboxSync(reason = "auto") {
+    if (!this.dropboxManager.isConnected) {
+      return;
+    }
+
+    if (this._autoSyncInFlight || this._hasPerformedInitialSync) {
+      return;
+    }
+
+    this._autoSyncInFlight = true;
+    this.syncFromDropbox({ auto: true, reason })
+      .catch(() => {
+        // Errors already logged inside syncFromDropbox
+      })
+      .finally(() => {
+        this._autoSyncInFlight = false;
+      });
   }
 
   updateLastBackupDisplay() {
@@ -181,31 +215,56 @@ class VitruvianApp {
     }
   }
 
-  async syncFromDropbox() {
+  async syncFromDropbox(options = {}) {
+    const auto = options?.auto === true;
+    const reason = options?.reason || (auto ? "auto" : "manual");
+
     if (!this.dropboxManager.isConnected) {
-      alert("Please connect to Dropbox first");
+      if (!auto) {
+        alert("Please connect to Dropbox first");
+      }
       return;
     }
 
     try {
       const statusDiv = document.getElementById("dropboxSyncStatus");
-      if (statusDiv) statusDiv.textContent = "Syncing...";
+      if (statusDiv) {
+        statusDiv.textContent = auto
+          ? "Auto-syncing from Dropbox..."
+          : "Syncing...";
+      }
 
-      this.addLogEntry("Syncing workouts from Dropbox...", "info");
+      this.addLogEntry(
+        `${auto ? "Auto-syncing" : "Syncing"} workouts from Dropbox (reason: ${reason})...`,
+        "info",
+      );
+
+      // Ensure existing workouts are normalized before comparisons
+      this.workoutHistory = this.workoutHistory
+        .map((workout) => this.normalizeWorkout(workout))
+        .filter(Boolean);
 
       // Load workouts from Dropbox
       const cloudWorkouts = await this.dropboxManager.loadWorkouts();
+      const normalizedCloud = cloudWorkouts
+        .map((workout) => this.normalizeWorkout(workout))
+        .filter(Boolean);
 
-      // Merge with local workouts (avoid duplicates by timestamp)
-      const existingTimestamps = new Set(
-        this.workoutHistory.map(w => (w.timestamp || w.endTime)?.getTime())
-      );
+      const existingTimestamps = new Set();
+      for (const workout of this.workoutHistory) {
+        const ts = (workout.timestamp || workout.endTime);
+        if (ts instanceof Date) {
+          existingTimestamps.add(ts.getTime());
+        }
+      }
 
       let newCount = 0;
-      for (const workout of cloudWorkouts) {
-        const timestamp = (workout.timestamp || workout.endTime)?.getTime();
-        if (!existingTimestamps.has(timestamp)) {
+      for (const workout of normalizedCloud) {
+        const ts = workout.timestamp || workout.endTime;
+        const timeValue = ts instanceof Date ? ts.getTime() : null;
+        if (timeValue && !existingTimestamps.has(timeValue)) {
           this.workoutHistory.unshift(workout);
+          existingTimestamps.add(timeValue);
           newCount++;
         }
       }
@@ -217,6 +276,11 @@ class VitruvianApp {
         return timeB - timeA;
       });
 
+      // Recalculate derived metrics after merge
+      this.workoutHistory.forEach((workout) => {
+        this.calculateTotalLoadPeakKg(workout);
+      });
+
       this.updateHistoryDisplay();
 
       const message = newCount > 0
@@ -224,7 +288,7 @@ class VitruvianApp {
         : "No new workouts found in Dropbox";
 
       // Update last backup display to show sync time
-      if (cloudWorkouts.length > 0) {
+      if (normalizedCloud.length > 0) {
         localStorage.setItem("vitruvian.dropbox.lastBackup", new Date().toISOString());
         this.updateLastBackupDisplay();
       }
@@ -232,19 +296,34 @@ class VitruvianApp {
       this.addLogEntry(message, "success");
       if (statusDiv) {
         statusDiv.textContent = message;
-        setTimeout(() => { if (statusDiv) statusDiv.textContent = ""; }, 5000);
+        setTimeout(() => {
+          if (statusDiv) statusDiv.textContent = "";
+        }, auto ? 3000 : 5000);
       }
+
+      this._hasPerformedInitialSync = true;
     } catch (error) {
       this.addLogEntry(`Failed to sync from Dropbox: ${error.message}`, "error");
       const statusDiv = document.getElementById("dropboxSyncStatus");
       if (statusDiv) {
         statusDiv.textContent = `Error: ${error.message}`;
-        setTimeout(() => { if (statusDiv) statusDiv.textContent = ""; }, 5000);
+        setTimeout(() => {
+          if (statusDiv) statusDiv.textContent = "";
+        }, 7000);
       }
     }
   }
 
-  async exportAllToDropboxCSV() {
+  async exportAllToDropboxCSV(options = {}) {
+    const manual = options?.manual === true;
+    if (!manual) {
+      this.addLogEntry(
+        "Blocked non-manual request to export all workouts as CSV",
+        "warning",
+      );
+      return;
+    }
+
     if (!this.dropboxManager.isConnected) {
       alert("Please connect to Dropbox first");
       return;
@@ -270,6 +349,10 @@ class VitruvianApp {
       this.addLogEntry(`Failed to export CSV: ${error.message}`, "error");
       alert(`Failed to export CSV: ${error.message}`);
     }
+  }
+
+  requestExportAllToDropboxCSV() {
+    return this.exportAllToDropboxCSV({ manual: true });
   }
 
   setWeightUnit(unit, options = {}) {
@@ -873,9 +956,186 @@ class VitruvianApp {
     this.updateStopButtonState();
   }
 
+  normalizeWorkout(workout) {
+    if (!workout || typeof workout !== "object") {
+      return null;
+    }
+
+    const toDate = (value) => {
+      if (!value) return null;
+      if (value instanceof Date) return value;
+      const date = new Date(value);
+      return Number.isNaN(date.getTime()) ? null : date;
+    };
+
+    const toNumber = (value) => {
+      const num = Number(value);
+      return Number.isFinite(num) ? num : 0;
+    };
+
+    if (typeof workout.setName === "string") {
+      workout.setName = workout.setName.trim();
+      if (workout.setName.length === 0) {
+        workout.setName = null;
+      }
+    }
+
+    if (typeof workout.mode === "string") {
+      workout.mode = workout.mode.trim();
+    }
+
+    workout.timestamp = toDate(workout.timestamp);
+    workout.startTime = toDate(workout.startTime);
+    workout.warmupEndTime = toDate(workout.warmupEndTime);
+    workout.endTime = toDate(workout.endTime);
+
+    if (!Array.isArray(workout.movementData)) {
+      workout.movementData = [];
+    }
+
+    workout.movementData = workout.movementData
+      .map((point) => {
+        if (!point) return null;
+        const ts = toDate(point.timestamp);
+        if (!ts) return null;
+        return {
+          timestamp: ts,
+          loadA: toNumber(point.loadA),
+          loadB: toNumber(point.loadB),
+          posA: toNumber(point.posA),
+          posB: toNumber(point.posB),
+        };
+      })
+      .filter(Boolean);
+
+    this.calculateTotalLoadPeakKg(workout);
+    return workout;
+  }
+
+  calculateTotalLoadPeakKg(workout) {
+    if (!workout || typeof workout !== "object") {
+      return 0;
+    }
+
+    const cached = Number(workout.totalLoadPeakKg);
+    if (Number.isFinite(cached) && cached > 0) {
+      return cached;
+    }
+
+    let peak = 0;
+    if (Array.isArray(workout.movementData) && workout.movementData.length > 0) {
+      for (const point of workout.movementData) {
+        const total =
+          (Number(point.loadA) || 0) + (Number(point.loadB) || 0);
+        if (total > peak) {
+          peak = total;
+        }
+      }
+    }
+
+    if (peak <= 0 && Number.isFinite(workout.weightKg)) {
+      peak = Math.max(peak, workout.weightKg * 2);
+    }
+
+    workout.totalLoadPeakKg = peak;
+    return peak;
+  }
+
+  getWorkoutIdentityInfo(workout) {
+    if (!workout) return null;
+
+    const setName =
+      typeof workout.setName === "string" && workout.setName.trim().length > 0
+        ? workout.setName.trim()
+        : null;
+    if (setName) {
+      return { key: `set:${setName.toLowerCase()}`, label: setName };
+    }
+
+    const mode =
+      typeof workout.mode === "string" && workout.mode.trim().length > 0
+        ? workout.mode.trim()
+        : null;
+    if (mode) {
+      return { key: `mode:${mode.toLowerCase()}`, label: mode };
+    }
+
+    return null;
+  }
+
+  hidePRBanner() {
+    const banner = document.getElementById("prBanner");
+    if (!banner) return;
+    banner.textContent = "";
+    banner.classList.add("hidden");
+    banner.classList.remove("pr-banner--new", "pr-banner--tie");
+  }
+
+  displayTotalLoadPR(workout) {
+    const banner = document.getElementById("prBanner");
+    if (!banner) return;
+
+    const identity = this.getWorkoutIdentityInfo(workout);
+    if (!identity) {
+      this.hidePRBanner();
+      return;
+    }
+
+    const currentPeakKg = this.calculateTotalLoadPeakKg(workout);
+    const relevantWorkouts = this.workoutHistory.filter((item) => {
+      const info = this.getWorkoutIdentityInfo(item);
+      return info && info.key === identity.key;
+    });
+
+    const priorBestKg = relevantWorkouts
+      .filter((item) => item !== workout)
+      .reduce((max, item) => {
+        const value = this.calculateTotalLoadPeakKg(item);
+        return value > max ? value : max;
+      }, 0);
+
+    const epsilon = 0.0001;
+    const isNewPR = currentPeakKg > priorBestKg + epsilon;
+    const matchedPR =
+      !isNewPR && Math.abs(currentPeakKg - priorBestKg) <= epsilon && priorBestKg > 0;
+
+    const bestKg = Math.max(currentPeakKg, priorBestKg);
+    const bestDisplay = this.formatWeightWithUnit(bestKg);
+    const currentDisplay = this.formatWeightWithUnit(currentPeakKg);
+
+    banner.classList.remove("hidden", "pr-banner--new", "pr-banner--tie");
+
+    if (isNewPR || priorBestKg <= 0) {
+      banner.classList.add("pr-banner--new");
+      banner.textContent = `New total load PR for ${identity.label}: ${bestDisplay}!`;
+      this.addLogEntry(
+        `New total load PR for ${identity.label}: ${bestDisplay}`,
+        "success",
+      );
+    } else if (matchedPR) {
+      banner.classList.add("pr-banner--tie");
+      banner.textContent = `Matched total load PR for ${identity.label}: ${bestDisplay}`;
+      this.addLogEntry(
+        `Matched total load PR for ${identity.label}: ${bestDisplay}`,
+        "info",
+      );
+    } else {
+      banner.textContent = `Total load PR for ${identity.label}: ${bestDisplay} (current set ${currentDisplay})`;
+      this.addLogEntry(
+        `Total load PR for ${identity.label} remains ${bestDisplay} (current set ${currentDisplay})`,
+        "info",
+      );
+    }
+  }
+
   addToWorkoutHistory(workout) {
-    this.workoutHistory.unshift(workout); // Add to beginning
+    const normalized = this.normalizeWorkout(workout);
+    if (!normalized) {
+      return null;
+    }
+    this.workoutHistory.unshift(normalized); // Add to beginning
     this.updateHistoryDisplay();
+    return normalized;
   }
 
   viewWorkoutOnGraph(index) {
@@ -888,7 +1148,15 @@ class VitruvianApp {
     this.chartManager.viewWorkout(workout);
   }
 
-  exportWorkoutDetailedCSV(index) {
+  exportWorkoutDetailedCSV(index, options = {}) {
+    if (options?.manual !== true) {
+      this.addLogEntry(
+        "Blocked non-manual request to export detailed workout CSV",
+        "warning",
+      );
+      return;
+    }
+
     if (index < 0 || index >= this.workoutHistory.length) {
       this.addLogEntry("Invalid workout index", "error");
       return;
@@ -942,12 +1210,16 @@ class VitruvianApp {
             ? `${this.formatWeightWithUnit(workout.weightKg)}`
             : "Adaptive";
         const hasTimingData = workout.startTime && workout.endTime;
+        const peakKg = this.calculateTotalLoadPeakKg(workout);
+        const peakText = peakKg > 0
+          ? ` • Peak ${this.formatWeightWithUnit(peakKg)}`
+          : "";
         const viewButtonHtml = hasTimingData
           ? `<button class="view-graph-btn" onclick="app.viewWorkoutOnGraph(${index})" title="View this workout on the graph">📊 View Graph</button>`
           : "";
         const hasMovementData = workout.movementData && workout.movementData.length > 0;
         const exportButtonHtml = hasMovementData
-          ? `<button class="view-graph-btn" onclick="app.exportWorkoutDetailedCSV(${index})" title="Export detailed CSV with all movement data">💾 Export CSV</button>`
+          ? `<button class="view-graph-btn" onclick="app.exportWorkoutDetailedCSV(${index}, { manual: true })" title="Export detailed CSV with all movement data">💾 Export CSV</button>`
           : "";
 return `
   <div class="history-item">
@@ -957,7 +1229,7 @@ return `
       ${workout.setNumber && workout.setTotal ? ` (Set ${workout.setNumber}/${workout.setTotal})` : ""}
     </div>
     <div class="history-item-details">
-      ${weightStr} • ${workout.reps} reps${hasMovementData ? ` • ${workout.movementData.length} data points` : ""}
+      ${weightStr} • ${workout.reps} reps${peakText}${hasMovementData ? ` • ${workout.movementData.length} data points` : ""}
     </div>
     ${viewButtonHtml}
     ${exportButtonHtml}
@@ -1003,7 +1275,7 @@ if (setLabel) setLabel.textContent = "";
       movementData: movementData,
     };
 
-    this.addToWorkoutHistory(workout);
+    const storedWorkout = this.addToWorkoutHistory(workout);
 
     // Log movement data capture
     if (movementData.length > 0) {
@@ -1012,9 +1284,16 @@ if (setLabel) setLabel.textContent = "";
       this.addLogEntry("Warning: No movement data captured for this workout", "warning");
     }
 
+    if (storedWorkout) {
+      this.displayTotalLoadPR(storedWorkout);
+    } else {
+      this.hidePRBanner();
+    }
+
     // Auto-save to Dropbox if connected
     if (this.dropboxManager.isConnected) {
-      this.dropboxManager.saveWorkout(workout)
+      const workoutToPersist = storedWorkout || workout;
+      this.dropboxManager.saveWorkout(workoutToPersist)
         .then(() => {
           // Store last backup timestamp
           localStorage.setItem("vitruvian.dropbox.lastBackup", new Date().toISOString());
@@ -1474,6 +1753,8 @@ if (setLabel) setLabel.textContent = "";
 
   async startProgram() {
     try {
+      this.hidePRBanner();
+
       const modeSelect = document.getElementById("mode");
       const weightInput = document.getElementById("weight");
       const repsInput = document.getElementById("reps");
@@ -1617,6 +1898,8 @@ if (setLabel) {
 
   async startEcho() {
     try {
+      this.hidePRBanner();
+
       const levelSelect = document.getElementById("echoLevel");
       const eccentricInput = document.getElementById("eccentric");
       const targetInput = document.getElementById("targetReps");
