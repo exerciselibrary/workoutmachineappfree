@@ -49,11 +49,26 @@ class VitruvianApp {
     this._hasPerformedInitialSync = false; // track if we've auto-synced once per session
     this._autoSyncInFlight = false;
 
+    this._personalBestHighlight = false; // track highlight state
+    this._confettiActive = false; // prevent overlapping confetti bursts
+    this._confettiCleanupTimer = null;
+
+    this.sidebarCollapsed = false;
+    this.loadSidebarPreference();
+
+    this.selectedHistoryKey = null; // currently selected history entry key
+    this.selectedHistoryIndex = null; // cache index for quick lookup
+
     // initialize plan UI dropdown from storage
     setTimeout(() => {
       this.populatePlanSelect();
       this.renderPlanUI();
+      this.applySidebarCollapsedState();
     }, 0);
+
+    window.addEventListener("resize", () => {
+      this.applySidebarCollapsedState();
+    });
 
 
   }
@@ -137,6 +152,7 @@ class VitruvianApp {
       this.updateLastBackupDisplay();
 
       this.scheduleAutoDropboxSync("connection-change");
+      this.syncPlansFromDropbox({ silent: true }).catch(() => {});
     } else {
       if (notConnectedDiv) notConnectedDiv.style.display = "block";
       if (connectedDiv) connectedDiv.style.display = "none";
@@ -287,6 +303,8 @@ class VitruvianApp {
         ? `Synced ${newCount} new workout(s) from Dropbox`
         : "No new workouts found in Dropbox";
 
+      await this.syncPlansFromDropbox({ silent: auto });
+
       // Update last backup display to show sync time
       if (normalizedCloud.length > 0) {
         localStorage.setItem("vitruvian.dropbox.lastBackup", new Date().toISOString());
@@ -310,6 +328,102 @@ class VitruvianApp {
         setTimeout(() => {
           if (statusDiv) statusDiv.textContent = "";
         }, 7000);
+      }
+    }
+  }
+
+  async syncPlansFromDropbox(options = {}) {
+    if (!this.dropboxManager.isConnected) {
+      return;
+    }
+
+    const silent = options?.silent === true;
+
+    try {
+      const payload = await this.dropboxManager.loadPlansIndex();
+      const plans =
+        payload && typeof payload === "object" && payload.plans
+          ? { ...payload.plans }
+          : {};
+
+      const existingNames = new Set(this.getAllPlanNames());
+      const localPlans = new Map();
+      for (const name of existingNames) {
+        const raw = localStorage.getItem(this.planKey(name));
+        if (raw) {
+          try {
+            localPlans.set(name, JSON.parse(raw));
+          } catch {
+            // ignore malformed local plan
+          }
+        }
+      }
+
+      const remoteNames = new Set(Object.keys(plans));
+      let uploadedCount = 0;
+      const failedUploads = new Set();
+
+      for (const [name, planItems] of localPlans.entries()) {
+        if (!remoteNames.has(name)) {
+          try {
+            await this.dropboxManager.savePlan(name, planItems);
+            plans[name] = JSON.parse(JSON.stringify(planItems || []));
+            remoteNames.add(name);
+            uploadedCount += 1;
+          } catch (error) {
+            failedUploads.add(name);
+            if (!silent) {
+              this.addLogEntry(
+                `Failed to upload local plan "${name}" to Dropbox: ${error.message}`,
+                "error",
+              );
+            }
+          }
+        }
+      }
+
+      const mergedNames = Object.keys(plans);
+      for (const name of failedUploads) {
+        if (!mergedNames.includes(name)) {
+          mergedNames.push(name);
+        }
+      }
+
+      const finalNames = this.setAllPlanNames(mergedNames);
+      const finalSet = new Set(finalNames);
+
+      for (const name of finalNames) {
+        if (!plans[name]) {
+          continue;
+        }
+        try {
+          const items = Array.isArray(plans[name]) ? plans[name] : [];
+          localStorage.setItem(this.planKey(name), JSON.stringify(items));
+        } catch {
+          // ignore local persistence errors
+        }
+      }
+
+      for (const name of existingNames) {
+        if (!finalSet.has(name) && !failedUploads.has(name)) {
+          localStorage.removeItem(this.planKey(name));
+        }
+      }
+
+      this.populatePlanSelect();
+
+      if (!silent) {
+        const summaryMessage = uploadedCount > 0
+          ? `Synced ${finalNames.length} plan${finalNames.length === 1 ? "" : "s"} from Dropbox (uploaded ${uploadedCount} local plan${uploadedCount === 1 ? "" : "s"})`
+          : `Synced ${finalNames.length} plan${finalNames.length === 1 ? "" : "s"} from Dropbox`;
+        this.addLogEntry(summaryMessage, "success");
+      }
+    } catch (error) {
+      if (!silent) {
+        this.addLogEntry(
+          `Failed to sync plans from Dropbox: ${error.message}`,
+          "error",
+        );
       }
     }
   }
@@ -596,23 +710,136 @@ class VitruvianApp {
 
     const unitLabel = this.getUnitLabel();
     const decimals = this.getLoadDisplayDecimals();
+    const wrapper = document.getElementById("personalBestWrapper");
+    const labelEl = wrapper
+      ? wrapper.querySelector(".personal-best-label")
+      : null;
+    const current = this.currentWorkout;
 
     const hasIdentity =
-      this.currentWorkout &&
-      typeof this.currentWorkout.identityKey === "string" &&
-      this.currentWorkout.identityKey.length > 0;
+      current &&
+      typeof current.identityKey === "string" &&
+      current.identityKey.length > 0;
+
+    if (labelEl) {
+      const hasLabel =
+        hasIdentity &&
+        typeof current.identityLabel === "string" &&
+        current.identityLabel.length > 0;
+      const suffix = hasLabel ? ` (${current.identityLabel})` : " (Total)";
+      labelEl.textContent = `Personal Best${suffix}`;
+    }
 
     const bestKg = hasIdentity
-      ? Number(this.currentWorkout.currentPersonalBestKg)
+      ? Number(current.currentPersonalBestKg)
       : NaN;
 
     if (!hasIdentity || !Number.isFinite(bestKg) || bestKg <= 0) {
       bestEl.innerHTML = `- <span class="stat-unit">${unitLabel}</span>`;
+      this.setPersonalBestHighlight(false);
       return;
     }
 
     const bestDisplay = this.convertKgToDisplay(bestKg).toFixed(decimals);
     bestEl.innerHTML = `${bestDisplay} <span class="stat-unit">${unitLabel}</span>`;
+    this.applyPersonalBestHighlight();
+  }
+
+  setPersonalBestHighlight(active) {
+    this._personalBestHighlight = !!active;
+    this.applyPersonalBestHighlight();
+  }
+
+  applyPersonalBestHighlight() {
+    const bestEl = document.getElementById("personalBestLoad");
+    if (!bestEl) {
+      return;
+    }
+    if (this._personalBestHighlight) {
+      bestEl.classList.add("highlight");
+    } else {
+      bestEl.classList.remove("highlight");
+    }
+  }
+
+  handlePersonalBestAchieved(bestKg) {
+    const identityLabel =
+      this.currentWorkout && this.currentWorkout.identityLabel
+        ? this.currentWorkout.identityLabel
+        : null;
+
+    if (this.currentWorkout) {
+      this.currentWorkout.hasNewPersonalBest = true;
+      const celebrated =
+        Number(this.currentWorkout.celebratedPersonalBestKg) || 0;
+      if (bestKg > celebrated) {
+        this.currentWorkout.celebratedPersonalBestKg = bestKg;
+      }
+    }
+
+    this.setPersonalBestHighlight(true);
+    this.updatePersonalBestDisplay();
+
+    const formatted = this.formatWeightWithUnit(bestKg);
+    const message = identityLabel
+      ? `New personal best for ${identityLabel}: ${formatted}`
+      : `New personal best: ${formatted}`;
+    this.addLogEntry(`🎉 ${message}`, "success");
+
+    this.triggerConfetti();
+  }
+
+  triggerConfetti() {
+    if (this._confettiActive) {
+      return;
+    }
+
+    this._confettiActive = true;
+
+    const container = document.createElement("div");
+    container.className = "confetti-container";
+    const root = document.body || document.documentElement;
+    if (!root) {
+      this._confettiActive = false;
+      return;
+    }
+    root.appendChild(container);
+
+    const colors = ["#51cf66", "#ffd43b", "#74c0fc", "#ff8787", "#845ef7"];
+    const pieceCount = 90;
+
+    for (let i = 0; i < pieceCount; i++) {
+      const piece = document.createElement("div");
+      piece.className = "confetti-piece";
+      piece.style.backgroundColor =
+        colors[i % colors.length];
+      piece.style.left = `${Math.random() * 100}%`;
+      piece.style.setProperty(
+        "--confetti-duration",
+        `${2.4 + Math.random()}s`,
+      );
+      piece.style.setProperty(
+        "--rotate-start",
+        `${Math.floor(Math.random() * 360)}deg`,
+      );
+      piece.style.setProperty(
+        "--rotate-end",
+        `${360 + Math.floor(Math.random() * 720)}deg`,
+      );
+      piece.style.animationDelay = `${Math.random() * 0.6}s`;
+
+      container.appendChild(piece);
+    }
+
+    if (this._confettiCleanupTimer) {
+      clearTimeout(this._confettiCleanupTimer);
+    }
+
+    this._confettiCleanupTimer = setTimeout(() => {
+      container.remove();
+      this._confettiActive = false;
+      this._confettiCleanupTimer = null;
+    }, 3500);
   }
 
   applyUnitToChart() {
@@ -720,17 +947,28 @@ class VitruvianApp {
       const previousPeak =
         Number(this.currentWorkout.livePeakTotalLoadKg) || 0;
       const livePeak = totalLoadKg > previousPeak ? totalLoadKg : previousPeak;
+      const celebrated =
+        Number(this.currentWorkout.celebratedPersonalBestKg) || 0;
+      const epsilon = 0.0001;
 
       this.currentWorkout.livePeakTotalLoadKg = livePeak;
       this.currentWorkout.currentPersonalBestKg = Math.max(
         priorBest,
         livePeak,
       );
+
+      if (
+        this.currentWorkout.identityKey &&
+        livePeak > celebrated + epsilon
+      ) {
+        this.currentWorkout.hasNewPersonalBest = true;
+        this.currentWorkout.celebratedPersonalBestKg = livePeak;
+        this.handlePersonalBestAchieved(livePeak);
+      }
     }
 
     // Update numeric displays
     this.renderLoadDisplays(sample);
-    document.getElementById("ticks").textContent = sample.ticks;
 
     // Update position values
     document.getElementById("posAValue").textContent = sample.posA;
@@ -763,6 +1001,18 @@ class VitruvianApp {
 
   // Delegate chart methods to ChartManager
   setTimeRange(seconds) {
+    const hadSelection =
+      this.selectedHistoryKey !== null || this.selectedHistoryIndex !== null;
+
+    if (hadSelection) {
+      this.selectedHistoryKey = null;
+      this.selectedHistoryIndex = null;
+      if (this.chartManager && typeof this.chartManager.clearEventMarkers === "function") {
+        this.chartManager.clearEventMarkers();
+      }
+      this.updateHistoryDisplay();
+    }
+
     this.chartManager.setTimeRange(seconds);
   }
 
@@ -771,24 +1021,68 @@ class VitruvianApp {
 
 
   exportData() {
+    const selectedIndex = this.getSelectedHistoryIndex();
+
+    if (selectedIndex >= 0) {
+      const workout = this.workoutHistory[selectedIndex];
+      if (!workout) {
+        this.addLogEntry("Selected workout no longer available for export.", "error");
+        this.selectedHistoryKey = null;
+        this.selectedHistoryIndex = null;
+        this.updateHistoryDisplay();
+        return;
+      }
+
+      this.exportWorkoutDetailedCSV(selectedIndex, {
+        manual: true,
+        source: "history-button",
+      });
+      return;
+    }
+
     this.chartManager.exportCSV();
   }
 
-  // Mobile sidebar toggle
+  // Sidebar toggle supporting desktop collapse and mobile drawer
   toggleSidebar() {
     const sidebar = document.getElementById("sidebar");
     const overlay = document.getElementById("overlay");
+    if (!sidebar) {
+      return;
+    }
 
-    sidebar.classList.toggle("open");
-    overlay.classList.toggle("show");
+    const isDesktop = window.matchMedia("(min-width: 769px)").matches;
+
+    if (isDesktop) {
+      this.sidebarCollapsed = !this.sidebarCollapsed;
+      this.applySidebarCollapsedState();
+      this.saveSidebarPreference(this.sidebarCollapsed);
+    } else {
+      sidebar.classList.toggle("open");
+      if (overlay) {
+        overlay.classList.toggle("show");
+      }
+      this.updateSidebarToggleVisual();
+    }
   }
 
   closeSidebar() {
     const sidebar = document.getElementById("sidebar");
     const overlay = document.getElementById("overlay");
+    if (!sidebar) {
+      return;
+    }
+
+    const isDesktop = window.matchMedia("(min-width: 769px)").matches;
+    if (isDesktop) {
+      return;
+    }
 
     sidebar.classList.remove("open");
-    overlay.classList.remove("show");
+    if (overlay) {
+      overlay.classList.remove("show");
+    }
+    this.updateSidebarToggleVisual();
   }
 
   // Toggle Just Lift mode UI
@@ -1140,6 +1434,11 @@ class VitruvianApp {
     this.currentWorkout.livePeakTotalLoadKg = 0;
     this.currentWorkout.currentPersonalBestKg =
       this.currentWorkout.priorBestTotalLoadKg || 0;
+    this.currentWorkout.hasNewPersonalBest = false;
+    this.currentWorkout.celebratedPersonalBestKg =
+      this.currentWorkout.currentPersonalBestKg || 0;
+
+    this.setPersonalBestHighlight(false);
 
     this.updatePersonalBestDisplay();
   }
@@ -1164,6 +1463,91 @@ class VitruvianApp {
     }
 
     return null;
+  }
+
+  getWorkoutHistoryKey(workout) {
+    if (!workout || typeof workout !== "object") {
+      return null;
+    }
+
+    const timestamp =
+      (workout.timestamp instanceof Date && workout.timestamp) ||
+      (workout.endTime instanceof Date && workout.endTime) ||
+      (workout.startTime instanceof Date && workout.startTime) ||
+      null;
+
+    return timestamp ? timestamp.getTime() : null;
+  }
+
+  loadSidebarPreference() {
+    try {
+      const stored = localStorage.getItem("vitruvian.sidebar.collapsed");
+      this.sidebarCollapsed = stored === "true";
+    } catch {
+      this.sidebarCollapsed = false;
+    }
+  }
+
+  saveSidebarPreference(collapsed) {
+    try {
+      localStorage.setItem(
+        "vitruvian.sidebar.collapsed",
+        collapsed ? "true" : "false",
+      );
+    } catch {
+      // Ignore storage errors silently
+    }
+  }
+
+  applySidebarCollapsedState() {
+    const appContainer = document.getElementById("appContainer");
+    const sidebar = document.getElementById("sidebar");
+    const overlay = document.getElementById("overlay");
+
+    if (!appContainer || !sidebar) {
+      return;
+    }
+
+    const isDesktop = window.matchMedia("(min-width: 769px)").matches;
+
+    if (isDesktop && this.sidebarCollapsed) {
+      appContainer.classList.add("sidebar-collapsed");
+    } else {
+      appContainer.classList.remove("sidebar-collapsed");
+    }
+
+    if (!isDesktop) {
+      sidebar.classList.remove("open");
+    }
+
+    if (overlay) {
+      overlay.classList.remove("show");
+    }
+
+    this.updateSidebarToggleVisual();
+  }
+
+  updateSidebarToggleVisual() {
+    const toggleBtn = document.getElementById("hamburger");
+    if (!toggleBtn) {
+      return;
+    }
+
+    const sidebar = document.getElementById("sidebar");
+    const isDesktop = window.matchMedia("(min-width: 769px)").matches;
+
+    let label;
+    if (isDesktop) {
+      toggleBtn.classList.toggle("is-collapsed", this.sidebarCollapsed);
+      label = this.sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar";
+    } else {
+      const isOpen = sidebar?.classList.contains("open");
+      toggleBtn.classList.remove("is-collapsed");
+      label = isOpen ? "Close sidebar" : "Open sidebar";
+    }
+
+    toggleBtn.setAttribute("aria-label", label);
+    toggleBtn.title = label;
   }
 
   hidePRBanner() {
@@ -1240,7 +1624,28 @@ class VitruvianApp {
     }
 
     const workout = this.workoutHistory[index];
+    const previousKey = this.selectedHistoryKey;
+    const newKey = this.getWorkoutHistoryKey(workout);
+
+    this.selectedHistoryKey = newKey;
+    this.selectedHistoryIndex = index;
+    this.updateHistoryDisplay();
+
     this.chartManager.viewWorkout(workout);
+
+    if (newKey !== previousKey) {
+      if (Array.isArray(workout.movementData) && workout.movementData.length > 0) {
+        this.addLogEntry(
+          "Selected workout ready to export via the Load History Export CSV button.",
+          "info",
+        );
+      } else {
+        this.addLogEntry(
+          "Selected workout has no detailed movement data available for export.",
+          "warning",
+        );
+      }
+    }
   }
 
   exportWorkoutDetailedCSV(index, options = {}) {
@@ -1295,8 +1700,13 @@ class VitruvianApp {
           No workouts completed yet
         </div>
       `;
+      this.selectedHistoryKey = null;
+      this.selectedHistoryIndex = null;
+      this.updateExportButtonLabel();
       return;
     }
+
+    let matchedSelection = false;
 
     historyList.innerHTML = this.workoutHistory
       .map((workout, index) => {
@@ -1309,28 +1719,97 @@ class VitruvianApp {
         const peakText = peakKg > 0
           ? ` • Peak ${this.formatWeightWithUnit(peakKg)}`
           : "";
-        const viewButtonHtml = hasTimingData
-          ? `<button class="view-graph-btn" onclick="app.viewWorkoutOnGraph(${index})" title="View this workout on the graph">📊 View Graph</button>`
-          : "";
         const hasMovementData = workout.movementData && workout.movementData.length > 0;
-        const exportButtonHtml = hasMovementData
-          ? `<button class="view-graph-btn" onclick="app.exportWorkoutDetailedCSV(${index}, { manual: true })" title="Export detailed CSV with all movement data">💾 Export CSV</button>`
+        const dataPointsText = hasMovementData
+          ? ` • ${workout.movementData.length} data points`
           : "";
-return `
-  <div class="history-item">
+
+        const key = this.getWorkoutHistoryKey(workout);
+        const isSelected =
+          (this.selectedHistoryKey !== null && key === this.selectedHistoryKey) ||
+          (this.selectedHistoryKey === null &&
+            this.selectedHistoryIndex === index);
+
+        if (isSelected) {
+          matchedSelection = true;
+          this.selectedHistoryIndex = index;
+        }
+
+        const buttonLabel = isSelected ? "📊 Viewing" : "📊 View Graph";
+        const buttonClass = isSelected ? "view-graph-btn active" : "view-graph-btn";
+        const viewButtonHtml = hasTimingData
+          ? `<button class="${buttonClass}" onclick="app.viewWorkoutOnGraph(${index})" title="View this workout on the graph">${buttonLabel}</button>`
+          : "";
+
+        return `
+  <div class="history-item${isSelected ? " selected" : ""}">
     <div class="history-item-title">
       ${workout.setName ? `${workout.setName}` : "Unnamed Set"}
       ${workout.mode ? ` — ${workout.mode}` : ""}
       ${workout.setNumber && workout.setTotal ? ` (Set ${workout.setNumber}/${workout.setTotal})` : ""}
     </div>
     <div class="history-item-details">
-      ${weightStr} • ${workout.reps} reps${peakText}${hasMovementData ? ` • ${workout.movementData.length} data points` : ""}
+      ${weightStr} • ${workout.reps} reps${peakText}${dataPointsText}
     </div>
     ${viewButtonHtml}
-    ${exportButtonHtml}
-  </div>    `;
+  </div>`;
       })
       .join("");
+
+    if (
+      (this.selectedHistoryKey !== null || this.selectedHistoryIndex !== null) &&
+      !matchedSelection
+    ) {
+      this.selectedHistoryKey = null;
+      this.selectedHistoryIndex = null;
+    }
+
+    this.updateExportButtonLabel();
+  }
+
+  getSelectedHistoryIndex() {
+    if (this.workoutHistory.length === 0) {
+      return -1;
+    }
+
+    if (
+      this.selectedHistoryIndex !== null &&
+      this.selectedHistoryIndex >= 0 &&
+      this.selectedHistoryIndex < this.workoutHistory.length
+    ) {
+      const candidate = this.workoutHistory[this.selectedHistoryIndex];
+      const candidateKey = this.getWorkoutHistoryKey(candidate);
+      if (
+        this.selectedHistoryKey === null ||
+        candidateKey === this.selectedHistoryKey
+      ) {
+        return this.selectedHistoryIndex;
+      }
+    }
+
+    if (this.selectedHistoryKey === null) {
+      return -1;
+    }
+
+    return this.workoutHistory.findIndex(
+      (workout) => this.getWorkoutHistoryKey(workout) === this.selectedHistoryKey,
+    );
+  }
+
+  updateExportButtonLabel() {
+    const exportBtn = document.getElementById("exportChartButton");
+    if (!exportBtn) {
+      return;
+    }
+
+    const selectedIndex = this.getSelectedHistoryIndex();
+    const hasSelection = selectedIndex >= 0;
+
+    exportBtn.textContent = hasSelection ? "Export Workout CSV" : "Export CSV";
+    exportBtn.title = hasSelection
+      ? "Export detailed movement data for the selected workout to Dropbox."
+      : "Export the current load history window as a CSV file.";
+    exportBtn.classList.toggle("export-selected", hasSelection);
   }
 
  completeWorkout() {
@@ -2688,17 +3167,33 @@ _beginRest(totalSec, onDone, labelText = "Next set", nextHtml = "", nextItemOrNa
   }
 
   setAllPlanNames(arr) {
-    try { localStorage.setItem(this.plansKey(), JSON.stringify(arr)); } catch {}
+    const names = Array.isArray(arr) ? Array.from(new Set(arr)) : [];
+    names.sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
+    try {
+      localStorage.setItem(this.plansKey(), JSON.stringify(names));
+    } catch {}
+    return names;
   }
 
   populatePlanSelect() {
     const sel = document.getElementById("planSelect");
     if (!sel) return;
     const names = this.getAllPlanNames();
-    sel.innerHTML = names.length ? names.map(n=>`<option value="${n}">${n}</option>`).join("") : `<option value="">(no saved plans)</option>`;
+    const previous = sel.value;
+    sel.innerHTML = names.length
+      ? names.map((n) => `<option value="${n}">${n}</option>`).join("")
+      : `<option value="">(no saved plans)</option>`;
+
+    if (names.length > 0) {
+      if (names.includes(previous)) {
+        sel.value = previous;
+      } else {
+        sel.value = names[0];
+      }
+    }
   }
 
-  saveCurrentPlan() {
+  async saveCurrentPlan() {
     const nameInput = document.getElementById("planNameInput");
     const name = (nameInput?.value || "").trim();
     if (!name) { alert("Enter a plan name first."); return; }
@@ -2711,14 +3206,34 @@ _beginRest(totalSec, onDone, labelText = "Next set", nextHtml = "", nextItemOrNa
       this.addLogEntry(`Saved plan "${name}" (${this.planItems.length} items)`, "success");
     } catch (e) {
       alert(`Could not save plan: ${e.message}`);
+      return;
+    }
+
+    if (this.dropboxManager.isConnected) {
+      try {
+        await this.dropboxManager.savePlan(name, this.planItems);
+        this.addLogEntry(`Uploaded plan "${name}" to Dropbox`, "success");
+      } catch (error) {
+        this.addLogEntry(
+          `Failed to sync plan "${name}" to Dropbox: ${error.message}`,
+          "error",
+        );
+        alert(`Plan saved locally but Dropbox sync failed: ${error.message}`);
+      }
     }
   }
 
-  loadSelectedPlan() {
+  async loadSelectedPlan() {
     const sel = document.getElementById("planSelect");
     if (!sel || !sel.value) { alert("No saved plan selected."); return; }
     try {
-      const raw = localStorage.getItem(this.planKey(sel.value));
+      let raw = localStorage.getItem(this.planKey(sel.value));
+
+      if (!raw && this.dropboxManager.isConnected) {
+        await this.syncPlansFromDropbox({ silent: true });
+        raw = localStorage.getItem(this.planKey(sel.value));
+      }
+
       if (!raw) { alert("Saved plan not found."); return; }
       this.planItems = JSON.parse(raw) || [];
       this.renderPlanUI();
@@ -2728,13 +3243,29 @@ _beginRest(totalSec, onDone, labelText = "Next set", nextHtml = "", nextItemOrNa
     }
   }
 
-  deleteSelectedPlan() {
+  async deleteSelectedPlan() {
     const sel = document.getElementById("planSelect");
     if (!sel || !sel.value) { alert("No saved plan selected."); return; }
     const name = sel.value;
+    const currentNames = this.getAllPlanNames();
+    const remaining = currentNames.filter((n) => n !== name);
+
+    if (this.dropboxManager.isConnected) {
+      try {
+        await this.dropboxManager.deletePlan(name);
+        this.addLogEntry(`Removed plan "${name}" from Dropbox`, "info");
+      } catch (error) {
+        this.addLogEntry(
+          `Failed to delete plan "${name}" from Dropbox: ${error.message}`,
+          "error",
+        );
+        alert(`Could not delete plan from Dropbox: ${error.message}`);
+        return;
+      }
+    }
+
     try {
       localStorage.removeItem(this.planKey(name));
-      const remaining = this.getAllPlanNames().filter(n=>n!==name);
       this.setAllPlanNames(remaining);
       this.populatePlanSelect();
       this.addLogEntry(`Deleted plan "${name}"`, "info");

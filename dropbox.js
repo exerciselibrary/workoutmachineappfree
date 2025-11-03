@@ -167,6 +167,17 @@ class DropboxManager {
         this.log(`Failed to create folder: ${error.message}`, "error");
       }
     }
+
+    try {
+      await this.dbx.filesCreateFolderV2({ path: "/plans" });
+      this.log("Created /plans folder", "success");
+    } catch (error) {
+      if (error.error?.error[".tag"] === "path" && error.error.error.path[".tag"] === "conflict") {
+        this.log("Plans folder already exists", "info");
+      } else {
+        this.log(`Failed to create plans folder: ${error.message}`, "error");
+      }
+    }
   }
 
   // Save workout to Dropbox
@@ -261,6 +272,91 @@ class DropboxManager {
     }
   }
 
+  plansIndexPath() {
+    return "/plans/plans.json";
+  }
+
+  async loadPlansIndex() {
+    if (!this.isConnected) {
+      throw new Error("Not connected to Dropbox");
+    }
+
+    try {
+      const response = await this.dbx.filesDownload({ path: this.plansIndexPath() });
+      const fileBlob = response.result.fileBlob;
+      const text = await fileBlob.text();
+      const data = JSON.parse(text);
+
+      const plans = data && typeof data.plans === "object" ? data.plans : {};
+      return {
+        version: data?.version ?? 1,
+        updatedAt: data?.updatedAt ?? null,
+        plans,
+      };
+    } catch (error) {
+      const summary = error?.error?.error_summary || "";
+      if (summary.includes("path/not_found/")) {
+        this.log("Plans index not found in Dropbox; starting with an empty set", "info");
+        return { version: 1, updatedAt: null, plans: {} };
+      }
+
+      this.log(`Failed to load plans index: ${error.message}`, "error");
+      throw error;
+    }
+  }
+
+  async savePlansIndex(plansMap) {
+    if (!this.isConnected) {
+      throw new Error("Not connected to Dropbox");
+    }
+
+    const payload = {
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      plans: plansMap || {},
+    };
+
+    await this.dbx.filesUpload({
+      path: this.plansIndexPath(),
+      contents: JSON.stringify(payload, null, 2),
+      mode: { ".tag": "overwrite" },
+    });
+
+    return true;
+  }
+
+  async savePlan(name, planItems) {
+    if (!this.isConnected) {
+      throw new Error("Not connected to Dropbox");
+    }
+
+    const index = await this.loadPlansIndex();
+    const plans = index.plans || {};
+    plans[name] = JSON.parse(JSON.stringify(planItems || []));
+    await this.savePlansIndex(plans);
+    this.log(`Saved plan "${name}" to Dropbox`, "success");
+    return true;
+  }
+
+  async deletePlan(name) {
+    if (!this.isConnected) {
+      throw new Error("Not connected to Dropbox");
+    }
+
+    const index = await this.loadPlansIndex();
+    const plans = index.plans || {};
+
+    if (!Object.prototype.hasOwnProperty.call(plans, name)) {
+      this.log(`Plan "${name}" not found in Dropbox`, "warning");
+      return false;
+    }
+
+    delete plans[name];
+    await this.savePlansIndex(plans);
+    this.log(`Deleted plan "${name}" from Dropbox`, "info");
+    return true;
+  }
+
   // Delete a workout from Dropbox (by timestamp match)
   async deleteWorkout(workout) {
     if (!this.isConnected) {
@@ -307,7 +403,10 @@ class DropboxManager {
         const weight = workout.weightKg || 0;
         const reps = workout.reps || 0;
         const setName = workout.setName || "";
-        const setNumber = workout.setNumber ? `${workout.setNumber}/${workout.setTotal || "?"}` : "";
+        const setNumber =
+          workout.setNumber !== undefined && workout.setNumber !== null
+            ? workout.setNumber
+            : "";
 
         // Calculate duration
         let duration = "";
