@@ -430,6 +430,7 @@ class VitruvianApp {
     this.renderLoadDisplays(this.currentSample);
     this.updateHistoryDisplay();
     this.applyUnitToChart();
+    this.updatePersonalBestDisplay();
   }
 
   getUnitLabel() {
@@ -583,6 +584,35 @@ class VitruvianApp {
       const totalKg = (safeSample.loadA || 0) + (safeSample.loadB || 0);
       totalEl.innerHTML = formatLoad(totalKg);
     }
+
+    this.updatePersonalBestDisplay();
+  }
+
+  updatePersonalBestDisplay() {
+    const bestEl = document.getElementById("personalBestLoad");
+    if (!bestEl) {
+      return;
+    }
+
+    const unitLabel = this.getUnitLabel();
+    const decimals = this.getLoadDisplayDecimals();
+
+    const hasIdentity =
+      this.currentWorkout &&
+      typeof this.currentWorkout.identityKey === "string" &&
+      this.currentWorkout.identityKey.length > 0;
+
+    const bestKg = hasIdentity
+      ? Number(this.currentWorkout.currentPersonalBestKg)
+      : NaN;
+
+    if (!hasIdentity || !Number.isFinite(bestKg) || bestKg <= 0) {
+      bestEl.innerHTML = `- <span class="stat-unit">${unitLabel}</span>`;
+      return;
+    }
+
+    const bestDisplay = this.convertKgToDisplay(bestKg).toFixed(decimals);
+    bestEl.innerHTML = `${bestDisplay} <span class="stat-unit">${unitLabel}</span>`;
   }
 
   applyUnitToChart() {
@@ -677,6 +707,26 @@ class VitruvianApp {
   updateLiveStats(sample) {
     // Store current sample for auto-stop checking
     this.currentSample = sample;
+
+    const totalLoadKg =
+      (Number(sample?.loadA) || 0) + (Number(sample?.loadB) || 0);
+
+    if (
+      this.currentWorkout &&
+      typeof this.currentWorkout === "object"
+    ) {
+      const priorBest =
+        Number(this.currentWorkout.priorBestTotalLoadKg) || 0;
+      const previousPeak =
+        Number(this.currentWorkout.livePeakTotalLoadKg) || 0;
+      const livePeak = totalLoadKg > previousPeak ? totalLoadKg : previousPeak;
+
+      this.currentWorkout.livePeakTotalLoadKg = livePeak;
+      this.currentWorkout.currentPersonalBestKg = Math.max(
+        priorBest,
+        livePeak,
+      );
+    }
 
     // Update numeric displays
     this.renderLoadDisplays(sample);
@@ -930,6 +980,7 @@ class VitruvianApp {
     this.warmupReps = 0;
     this.workingReps = 0;
     this.currentWorkout = null;
+    this.updatePersonalBestDisplay();
     this.topPositionsA = [];
     this.bottomPositionsA = [];
     this.topPositionsB = [];
@@ -1041,6 +1092,58 @@ class VitruvianApp {
     return peak;
   }
 
+  getPriorBestTotalLoadKg(identity, options = {}) {
+    if (!identity || typeof identity.key !== "string") {
+      return 0;
+    }
+
+    const excludeWorkout = options.excludeWorkout || null;
+    let best = 0;
+
+    for (const item of this.workoutHistory) {
+      if (excludeWorkout && item === excludeWorkout) {
+        continue;
+      }
+
+      const info = this.getWorkoutIdentityInfo(item);
+      if (!info || info.key !== identity.key) {
+        continue;
+      }
+
+      const value = this.calculateTotalLoadPeakKg(item);
+      if (value > best) {
+        best = value;
+      }
+    }
+
+    return best;
+  }
+
+  initializeCurrentWorkoutPersonalBest() {
+    if (!this.currentWorkout) {
+      this.updatePersonalBestDisplay();
+      return;
+    }
+
+    const identity = this.getWorkoutIdentityInfo(this.currentWorkout);
+    if (identity) {
+      this.currentWorkout.identityKey = identity.key;
+      this.currentWorkout.identityLabel = identity.label;
+      this.currentWorkout.priorBestTotalLoadKg =
+        this.getPriorBestTotalLoadKg(identity);
+    } else {
+      this.currentWorkout.identityKey = null;
+      this.currentWorkout.identityLabel = null;
+      this.currentWorkout.priorBestTotalLoadKg = 0;
+    }
+
+    this.currentWorkout.livePeakTotalLoadKg = 0;
+    this.currentWorkout.currentPersonalBestKg =
+      this.currentWorkout.priorBestTotalLoadKg || 0;
+
+    this.updatePersonalBestDisplay();
+  }
+
   getWorkoutIdentityInfo(workout) {
     if (!workout) return null;
 
@@ -1082,17 +1185,9 @@ class VitruvianApp {
     }
 
     const currentPeakKg = this.calculateTotalLoadPeakKg(workout);
-    const relevantWorkouts = this.workoutHistory.filter((item) => {
-      const info = this.getWorkoutIdentityInfo(item);
-      return info && info.key === identity.key;
+    const priorBestKg = this.getPriorBestTotalLoadKg(identity, {
+      excludeWorkout: workout,
     });
-
-    const priorBestKg = relevantWorkouts
-      .filter((item) => item !== workout)
-      .reduce((max, item) => {
-        const value = this.calculateTotalLoadPeakKg(item);
-        return value > max ? value : max;
-      }, 0);
 
     const epsilon = 0.0001;
     const isNewPR = currentPeakKg > priorBestKg + epsilon;
@@ -1851,6 +1946,7 @@ const planItem = inPlan ? this.planItems[this.planCursor.index] : null;
   itemType: planItem?.type || "exercise",
 
       };
+      this.initializeCurrentWorkoutPersonalBest();
       this.updateRepCounters();
 
       // Show auto-stop timer if Just Lift mode
@@ -1967,6 +2063,7 @@ this.currentWorkout = {
   itemType: planItem?.type || "echo",
 
       };
+      this.initializeCurrentWorkoutPersonalBest();
       this.updateRepCounters();
 
       // Show auto-stop timer if Just Lift mode
