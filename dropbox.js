@@ -37,7 +37,7 @@ class DropboxManager {
     const token = this.getStoredToken();
     if (token) {
       try {
-        this.dbx = new Dropbox.Dropbox({ accessToken: token, fetch: fetch });
+        this.dbx = new Dropbox.Dropbox({ accessToken: token, fetch: window.fetch.bind(window) });
         // Test token validity
         await this.dbx.usersGetCurrentAccount();
         this.isConnected = true;
@@ -124,7 +124,7 @@ class DropboxManager {
       this.storeToken(accessToken);
 
       // Initialize Dropbox SDK
-      this.dbx = new Dropbox.Dropbox({ accessToken: accessToken, fetch: fetch });
+      this.dbx = new Dropbox.Dropbox({ accessToken: accessToken, fetch: window.fetch.bind(window) });
       this.isConnected = true;
 
       // Get user info
